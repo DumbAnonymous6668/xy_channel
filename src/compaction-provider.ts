@@ -251,10 +251,76 @@ export const xiaoyiCompactionProvider = {
       throw new Error(`Compaction API returned ${response.status}`);
     }
 
-    const data = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-    const summary = data.choices?.[0]?.message?.content;
+    // The /chat/completions endpoint returns an SSE stream (text/event-stream).
+    // Parse it by accumulating choices[0].delta.content from each data frame.
+    // Fallback to JSON parsing if the server returns a non-SSE response.
+    const contentType = response.headers.get("content-type") || "";
+    let summary: string | undefined;
+
+    if (contentType.includes("text/event-stream") || contentType.includes("text/event")) {
+      // ── SSE stream parsing ─────────────────────────────────────
+      if (!response.body) {
+        throw new Error("Response body is null for SSE stream");
+      }
+
+      let buffer = "";
+      const chunks: string[] = [];
+
+      for await (const chunk of response.body) {
+        if (!chunk) continue;
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmedLine = line.replace(/\r$/, "");
+          if (!trimmedLine || !trimmedLine.startsWith("data:")) continue;
+
+          const dataContent = trimmedLine.slice(5).trim();
+          if (!dataContent || dataContent === "[DONE]") continue;
+
+          try {
+            const dataJson = JSON.parse(dataContent);
+            // OpenAI-compatible SSE: accumulate delta.content
+            const delta = dataJson?.choices?.[0]?.delta?.content;
+            if (typeof delta === "string" && delta) {
+              chunks.push(delta);
+            }
+            // Some servers send a final non-streaming frame with message.content
+            const message = dataJson?.choices?.[0]?.message?.content;
+            if (typeof message === "string" && message) {
+              chunks.push(message);
+            }
+          } catch {
+            // Non-JSON data frame (e.g. ping/heartbeat), skip
+          }
+        }
+      }
+
+      // Flush any remaining buffer
+      if (buffer.startsWith("data:")) {
+        const dataContent = buffer.slice(5).trim();
+        if (dataContent && dataContent !== "[DONE]") {
+          try {
+            const dataJson = JSON.parse(dataContent);
+            const delta = dataJson?.choices?.[0]?.delta?.content;
+            if (typeof delta === "string" && delta) chunks.push(delta);
+            const message = dataJson?.choices?.[0]?.message?.content;
+            if (typeof message === "string" && message) chunks.push(message);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      summary = chunks.join("");
+    } else {
+      // ── Non-SSE JSON response (fallback) ────────────────────────
+      const data = (await response.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      summary = data.choices?.[0]?.message?.content;
+    }
 
     if (!summary?.trim()) {
       logger.warn("[compaction-provider] empty summary returned");
