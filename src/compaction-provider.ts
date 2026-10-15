@@ -266,7 +266,9 @@ export const xiaoyiCompactionProvider = {
       let buffer = "";
       const chunks: string[] = [];
 
-      for await (const chunk of response.body) {
+      // @types/node@20 的 web ReadableStream 类型未声明 Symbol.asyncIterator，
+      // 故先过 unknown 再做显式 AsyncIterable 断言以让 TS 编译通过；运行时语义不变。
+      for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
         if (!chunk) continue;
         buffer += chunk.toString();
         const lines = buffer.split("\n");
