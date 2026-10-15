@@ -2,7 +2,11 @@
 import type { ClawdbotConfig, RuntimeEnv, ReplyPayload } from "openclaw/plugin-sdk";
 import { resolveRuntimeConversationBindingRoute } from "openclaw/plugin-sdk/conversation-runtime";
 import { updateSessionStoreEntry, updateSessionStore, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
-import { callGatewayTool } from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  callGatewayTool,
+  resolveActiveEmbeddedRunSessionId,
+  abortAgentHarnessRun,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
 import { getXYRuntime } from "../runtime.js";
 import { createXYReplyDispatcher } from "./reply-dispatcher.js";
 import { parseA2AMessage, extractTextFromParts, extractFileParts, extractPushId, extractDeviceType, extractAppVer, extractSdkApiVersion, extractModelName, extractTriggerData, extractRunCrossTaskContext, isClearContextMessage, isTasksCancelMessage } from "../parser.js";
@@ -26,6 +30,7 @@ import {
   completeTask,
   hasActiveTask,
   bindSessionKey,
+  getSession,
   getWaitState,
   hasWaitState,
   markParentSettled,
@@ -109,6 +114,22 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
       }
       const log = logger.withContext(sessionId, taskId);
       log.log(`[BOT] Tasks cancel request`);
+
+      // 让"停止"真正停止：abort 当前活跃 run，避免在途上一轮完整吐到端侧。
+      // 通过 conversation-manager 的 getSession 拿到 openclaw sessionKey，再解析活跃 run。
+      const sessionKey = getSession(sessionId)?.sessionKey;
+      if (!sessionKey) {
+        log.warn(`[TASKS_CANCEL] No sessionKey bound for sessionId, cannot abort active run`);
+      } else {
+        const activeRun = resolveActiveEmbeddedRunSessionId(sessionKey);
+        if (activeRun) {
+          const aborted = abortAgentHarnessRun(activeRun);
+          log.log(`[TASKS_CANCEL] aborted active run=${activeRun} result=${aborted}`);
+        } else {
+          log.log(`[TASKS_CANCEL] No active embedded run for sessionKey, nothing to abort`);
+        }
+      }
+
       const config = resolveXYConfig(cfg);
       await sendTasksCancelResponse({
         config,
