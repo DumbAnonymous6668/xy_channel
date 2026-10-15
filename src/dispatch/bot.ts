@@ -36,6 +36,9 @@ import {
   markParentSettled,
   markTurnInflight,
   clearTurnInflight,
+  markTurnAborted,
+  consumeAbortedTurnSuppression,
+  clearAbortedTurnSuppression,
   cacheXYConfig,
   getCurrentTaskId,
   clearWaitState,
@@ -84,6 +87,9 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
       }
       const log = logger.withContext(sessionId, "");
       log.log(`[BOT] Clear context request`);
+      // 清空上下文即确认废弃旧状态：一并清除"最近被中止 turn"标记，
+      // 避免清空后第一条消息误带"忽略上一轮"抑制指令（上下文已无旧轮可补答）。
+      clearAbortedTurnSuppression(sessionId);
       const config = resolveXYConfig(cfg);
       await sendClearContextResponse({
         config,
@@ -125,6 +131,12 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
         if (activeRun) {
           const aborted = abortAgentHarnessRun(activeRun);
           log.log(`[TASKS_CANCEL] aborted active run=${activeRun} result=${aborted}`);
+          if (aborted) {
+            // 标记该会话的上一轮被用户"停止"：下一条真实用户消息派发前
+            // 将注入"忽略被取消轮次"抑制指令，防止被中止的 T-1 轮内容
+            // 泄漏到下一轮回答。
+            markTurnAborted(sessionId, taskId);
+          }
         } else {
           log.log(`[TASKS_CANCEL] No active embedded run for sessionKey, nothing to abort`);
         }
@@ -353,6 +365,21 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
     // Extract text and files from parts
     const text = extractTextFromParts(parsed.parts);
     let textForAgent = text || "";
+
+    // ── 停止后首轮上下文隔离（suppress aborted turn carry-over） ──
+    // 若上一轮被用户"停止"（tasks/cancel 中止了在途 run，见 markTurnAborted），
+    // 则在本次派发前给消息注入一条抑制指令：提示模型完全忽略被取消的上一轮
+    // 及其未完成输出，只回答用户最新问题。openclaw 的会话 transcript 以 sqlite
+    // 存储，插件侧无法安全回滚已提交内容，故在提示词层做上下文隔离。
+    // 一次性语义：消费后标记立即清除，后续消息不会再携带该指令。
+    if (consumeAbortedTurnSuppression(parsed.sessionId)) {
+      textForAgent =
+        `【系统提示】用户已点击"停止"中止了上一条请求，该请求及其未完成的输出` +
+        `已作废，请完全忽略它，不要重提、补答、继续或联想上一轮被取消的内容。` +
+        `现在请只针对下面用户最新提出的问题作答。\n` +
+        `最新问题：${textForAgent}`;
+      log.log(`[TURN-ABORTED] Prepended next-turn suppression instruction`);
+    }
     // Self-evolution keyword nudge — only for real user messages
     if (route.sessionKey && textForAgent) {
       try {

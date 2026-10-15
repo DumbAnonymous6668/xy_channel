@@ -266,11 +266,18 @@ export const xiaoyiCompactionProvider = {
       let buffer = "";
       const chunks: string[] = [];
 
+      // 流式解码器：跨网络 chunk 顺序带状态（{ stream: true }），多字节 UTF-8
+      // 字符被切在 chunk 边界时能正确续接，而不是各自独立解码产生替换符 U+FFFD。
+      // decoder 必须存活于整个循环（每次迭代复用），循环结束后 flush 残留字节。
+      const decoder = new TextDecoder();
+
       // @types/node@20 的 web ReadableStream 类型未声明 Symbol.asyncIterator，
       // 故先过 unknown 再做显式 AsyncIterable 断言以让 TS 编译通过；运行时语义不变。
       for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
         if (!chunk) continue;
-        buffer += chunk.toString();
+        // chunk 是 Uint8Array，其 toString() 返回逗号分隔的字节数字串而非文本，
+        // 必须用 TextDecoder 按 UTF-8 解码，否则永远匹配不到 data: 帧导致压缩必失败。
+        buffer += decoder.decode(chunk, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
 
@@ -298,6 +305,9 @@ export const xiaoyiCompactionProvider = {
           }
         }
       }
+
+      // Flush decoder 残留的尾部分字节（若流最后一个 chunk 截断了多字节字符）。
+      buffer += decoder.decode();
 
       // Flush any remaining buffer
       if (buffer.startsWith("data:")) {
