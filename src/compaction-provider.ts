@@ -27,6 +27,10 @@ interface CompactionConfig {
   baseUrl: string;
   modelName: string;
   apiKey?: string;
+  /** Provider-level auth headers (x-uid/x-api-key/...), captured from
+   *  models.providers.xiaoyiprovider.headers. Used to authorize the
+   *  compaction summarization request when no session snapshot exists. */
+  headers?: Record<string, string>;
 }
 
 /**
@@ -187,9 +191,15 @@ export const xiaoyiCompactionProvider = {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      // uid-fallback: no session snapshot (compaction may fire on the very
+      // first turn before any normal LLM call captured auth headers). Attach
+      // the provider-level headers captured from models.providers.xiaoyiprovider
+      // so the compaction summarization request is still authorized.
+      ...(session ? {} : cfg.headers),
       ...modelHdrs,
       ...reqHdrs,
-      ...(session?.apiKey ? { Authorization: `Bearer ${session.apiKey}` } : {}),
+      ...(session?.apiKey ? { Authorization: `Bearer ${session.apiKey}` }
+        : !session && cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {}),
       [HEADER_TRACE_ID]: traceId,
       [HEADER_SESSION_ID]: sessionId,
       [HEADER_INTERACTION_ID]: interactionId,
