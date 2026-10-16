@@ -127,6 +127,25 @@ function formatMessagesForSummarization(messages: unknown[]): string {
   return lines.join("\n\n");
 }
 
+/**
+ * Extract streamed text from a single chat.completion choice. Compatible with:
+ *  - OpenAI SSE streaming: choices[0].delta.content
+ *  - OpenAI final (non-streaming): choices[0].message.content
+ *  - Xiaoyi compaction API: choices[0].message.token_text (token-level deltas)
+ * Almost all compaction backends emit text in one of these three fields.
+ */
+function extractChoiceContent(choice: Record<string, unknown>): string {
+  const delta = isRecord(choice.delta) ? (choice.delta as Record<string, unknown>) : undefined;
+  const message = isRecord(choice.message) ? (choice.message as Record<string, unknown>) : undefined;
+  const content = delta?.content ?? message?.content ?? message?.token_text;
+  return typeof content === "string" ? content : "";
+}
+
+/** Type guard: plain object (excludes null and arrays). */
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
 // ── CompactionProvider ────────────────────────────────────────────
 export const xiaoyiCompactionProvider = {
   id: "xiaoyiprovider",
@@ -261,20 +280,26 @@ export const xiaoyiCompactionProvider = {
       throw new Error(`Compaction API returned ${response.status}`);
     }
 
-    // The /chat/completions endpoint returns an SSE stream (text/event-stream).
-    // Parse it by accumulating choices[0].delta.content from each data frame.
-    // Fallback to JSON parsing if the server returns a non-SSE response.
+    // 兼容多种响应形态：标准 text/event-stream SSE 帧、纯 JSON，以及
+    // content-type 标为 application/json 但 body 实为 `data:` 帧的自定义
+    // SSE（xiaoyi compaction API /chat/completions 即如此，curl 实测每帧形如
+    // `data: {"choices":[{"message":{"token_text":"..."}}]}`）。
     const contentType = response.headers.get("content-type") || "";
     let summary: string | undefined;
 
-    if (contentType.includes("text/event-stream") || contentType.includes("text/event")) {
-      // ── SSE stream parsing ─────────────────────────────────────
-      if (!response.body) {
-        throw new Error("Response body is null for SSE stream");
-      }
+    if (
+      response.body &&
+      (contentType.includes("text/event-stream") ||
+        contentType.includes("text/event") ||
+        contentType.includes("application/json"))
+    ) {
+      // ── SSE / JSON 统一按行解析 ─────────────────────────────
+      const streamBody = response.body as unknown as AsyncIterable<Uint8Array>;
 
       let buffer = "";
+      let fullText = "";
       const chunks: string[] = [];
+      let sawDataFrame = false;
 
       // 流式解码器：跨网络 chunk 顺序带状态（{ stream: true }），多字节 UTF-8
       // 字符被切在 chunk 边界时能正确续接，而不是各自独立解码产生替换符 U+FFFD。
@@ -283,32 +308,30 @@ export const xiaoyiCompactionProvider = {
 
       // @types/node@20 的 web ReadableStream 类型未声明 Symbol.asyncIterator，
       // 故先过 unknown 再做显式 AsyncIterable 断言以让 TS 编译通过；运行时语义不变。
-      for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+      for await (const chunk of streamBody) {
         if (!chunk) continue;
         // chunk 是 Uint8Array，其 toString() 返回逗号分隔的字节数字串而非文本，
         // 必须用 TextDecoder 按 UTF-8 解码，否则永远匹配不到 data: 帧导致压缩必失败。
-        buffer += decoder.decode(chunk, { stream: true });
+        const decoded = decoder.decode(chunk, { stream: true });
+        buffer += decoded;
+        fullText += decoded;
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
 
         for (const line of lines) {
           const trimmedLine = line.replace(/\r$/, "");
           if (!trimmedLine || !trimmedLine.startsWith("data:")) continue;
+          sawDataFrame = true;
 
           const dataContent = trimmedLine.slice(5).trim();
           if (!dataContent || dataContent === "[DONE]") continue;
 
           try {
             const dataJson = JSON.parse(dataContent);
-            // OpenAI-compatible SSE: accumulate delta.content
-            const delta = dataJson?.choices?.[0]?.delta?.content;
-            if (typeof delta === "string" && delta) {
-              chunks.push(delta);
-            }
-            // Some servers send a final non-streaming frame with message.content
-            const message = dataJson?.choices?.[0]?.message?.content;
-            if (typeof message === "string" && message) {
-              chunks.push(message);
+            // Accumulate any of delta.content / message.content / message.token_text
+            const content = extractChoiceContent(dataJson?.choices?.[0]);
+            if (content) {
+              chunks.push(content);
             }
           } catch {
             // Non-JSON data frame (e.g. ping/heartbeat), skip
@@ -317,21 +340,34 @@ export const xiaoyiCompactionProvider = {
       }
 
       // Flush decoder 残留的尾部分字节（若流最后一个 chunk 截断了多字节字符）。
-      buffer += decoder.decode();
+      const flushTail = decoder.decode();
+      buffer += flushTail;
+      fullText += flushTail;
 
-      // Flush any remaining buffer
-      if (buffer.startsWith("data:")) {
-        const dataContent = buffer.slice(5).trim();
+      // Flush any remaining buffer (可能带尾随换行/空行前缀)
+      if (buffer.trimStart().startsWith("data:")) {
+        sawDataFrame = true;
+        const dataContent = buffer.trimStart().slice(5).trim();
         if (dataContent && dataContent !== "[DONE]") {
           try {
             const dataJson = JSON.parse(dataContent);
-            const delta = dataJson?.choices?.[0]?.delta?.content;
-            if (typeof delta === "string" && delta) chunks.push(delta);
-            const message = dataJson?.choices?.[0]?.message?.content;
-            if (typeof message === "string" && message) chunks.push(message);
+            const content = extractChoiceContent(dataJson?.choices?.[0]);
+            if (content) chunks.push(content);
           } catch {
             // ignore
           }
+        }
+      }
+
+      // 非 SSE：body 是单条纯 JSON（无 data: 帧，可能为格式化多行 JSON）时，
+      // 用累积的完整原始文本整体解析，避免 split("\n") 拆行后丢行。
+      if (!sawDataFrame && fullText.trim()) {
+        try {
+          const dataJson = JSON.parse(fullText.trim());
+          const content = extractChoiceContent(dataJson?.choices?.[0]);
+          if (content && !chunks.includes(content)) chunks.push(content);
+        } catch {
+          // ignore
         }
       }
 
@@ -339,9 +375,9 @@ export const xiaoyiCompactionProvider = {
     } else {
       // ── Non-SSE JSON response (fallback) ────────────────────────
       const data = (await response.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<Record<string, unknown>>;
       };
-      summary = data.choices?.[0]?.message?.content;
+      summary = data.choices?.[0] ? extractChoiceContent(data.choices[0]) : undefined;
     }
 
     if (!summary?.trim()) {
