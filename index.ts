@@ -17,6 +17,8 @@ import { normalizeToolRetrieverConfig } from "./src/skill-retriever/config.js";
 import { registerCLIHook } from "./src/tools/hmos-cli.js";
 import { recoverCronState } from "./src/cron-recovery.js";
 import type { CronRecoveryResult } from "./src/cron-recovery.js";
+import { syncScheduledTaskOnCronChanged } from "./src/cron-scheduled-tasks-sync.js";
+import { writeCronRunLog } from "./src/utils/cron-run-logger.js";
 import { writeSkillUsage } from "./src/utils/skills-logger.js";
 import {
   markSubagentSpawned,
@@ -26,31 +28,25 @@ import {
 import { notifyCronAgentEnd } from "./src/conversation/cron-buffer.js";
 import { logger } from "./src/utils/logger.js";
 
-/**
- * Parse a file path string to detect if it refers to a SKILL.md file within
- * a skills directory. Returns the skill name (parent directory) if so.
- *
- * Matches paths like:
- *   ~/.openclaw/workspace/skills/my-skill/SKILL.md
- *   /home/user/core_skills/my-skill/SKILL.md
- *   skills/my-skill/SKILL.md
- */
-function extractSkillNameFromPath(filePath: unknown): string | null {
-  if (typeof filePath !== "string" || !filePath) return null;
-  // Normalize common path prefixes
-  const normalized = filePath.replace(/^~\//, "/home/").replace(/\\/g, "/");
-  // Match: .../skills/<skillName>/SKILL.md  or  .../skills/<skillName>/...
-  // Also match: .../core_skills/<skillName>/SKILL.md
-  const match = normalized.match(/\/(?:core_)?skills\/([^/]+)\/SKILL\.md$/i);
-  return match ? match[1] : null;
+/** 从路径/文本中提取技能名：.../skills/<name> 或 .../core_skills/<name>。
+ *  与 pc 链路 stepinfo 的提取逻辑一致（dm 仓库 step-info-tool.ts 同款正则）。 */
+function extractSkillNameFromPathText(text: string): string | null {
+  const normalized = text.replace(/\\/g, "/");
+  const m = normalized.match(/(?:^|[/\s"';&|])(?:core_)?skills\/([^/'"\s;&|]+)/i);
+  return m ? m[1] : null;
 }
 
 /**
- * Register the skills diagnostic event listener via after_tool_call hook.
+ * Register the skills usage logging hook via before_tool_call.
  *
- * When openclaw fires a `skill.used` diagnostic event, the skill's SKILL.md
- * is typically read by the model first.  We detect SKILL.md reads through
- * the `after_tool_call` hook and write the skill name to the skills log.
+ * Two detection paths, each hit writes one line to the skills log
+ * (no dedup — N uses within one turn produce N lines):
+ *  1. Device tool mapping: known device tools (incl. the call_device_tool
+ *     wrapper, resolved via params.toolName) map to their owning skill.
+ *  2. exec/bash command inspection: the command references a skill path
+ *     (.../skills/<name>/... or .../core_skills/<name>/...). `cd` into a
+ *     skill directory is covered by the same path match (the char before
+ *     "skills" is always a boundary: space, slash or quote).
  */
 function registerSkillsDiagnosticHook(api: OpenClawPluginApi) {
   // Skill name → tool names mapping for direct tool-based skill usage logging
@@ -83,19 +79,23 @@ function registerSkillsDiagnosticHook(api: OpenClawPluginApi) {
     return event.toolName;
   }
 
-  // Log skill usage for known device tools on before_tool_call
+  // Log skill usage on before_tool_call: device tools via TOOL_SKILL_MAP,
+  // exec/bash via skill path detection in the command.
   api.on("before_tool_call", async (event, _ctx) => {
     const actualToolName = resolveActualToolName(event);
-    const skillName = TOOL_SKILL_MAP[actualToolName];
-    if (skillName) {
-      writeSkillUsage(skillName);
-    }
-  });
 
-  // Detect SKILL.md reads on after_tool_call (original behavior)
-  api.on("after_tool_call", async (event, _ctx) => {
-    if (event.toolName === "read") {
-      const skillName = extractSkillNameFromPath(event.params?.path);
+    // 1. Device tool → owning skill
+    const mappedSkill = TOOL_SKILL_MAP[actualToolName];
+    if (mappedSkill) {
+      writeSkillUsage(mappedSkill);
+      return;
+    }
+
+    // 2. exec/bash command references a skill path (incl. cd into skill dir)
+    if (actualToolName === "exec" || actualToolName === "bash") {
+      const command = event.params?.command;
+      if (typeof command !== "string" || command.length === 0) return;
+      const skillName = extractSkillNameFromPathText(command);
       if (skillName) {
         writeSkillUsage(skillName);
       }
@@ -289,6 +289,36 @@ function readJobIdFromResult(result: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Register the cron run logging hook.
+ *
+ * Gateway 的 CronService 在 job 生命周期变化时触发 cron_changed 插件 hook；
+ * 仅 action === "finished" 携带本次执行的结果字段（status/durationMs/
+ * runAtMs/nextRunAtMs/sessionId/model），added/updated/removed/started 不记。
+ * 每个执行结束的 run 写一行到 /tmp/openclaw/cron-YYYYMMDD.log。
+ */
+function registerCronRunLogHook(api: OpenClawPluginApi) {
+  api.on("cron_changed", async (event) => {
+    try {
+      if (event.action !== "finished") return;
+      writeCronRunLog({
+        jobId: event.jobId,
+        name: event.job?.name ?? null,
+        createdAtMs: event.job?.createdAtMs ?? null,
+        status: event.status ?? null,
+        durationMs: event.durationMs ?? null,
+        runAtMs: event.runAtMs ?? null,
+        nextRunMs: event.nextRunAtMs ?? null,
+        sessionId: event.sessionId ?? null,
+        model: event.model ?? null,
+        error: event.error ?? null,
+      });
+    } catch (err) {
+      logger.error(`[XY-CRON-LOG] Error in cron_changed run-log hook:`, err);
+    }
+  });
+}
+
 // ── Gateway startup: cron state recovery ────────────────────────────────────
 
 /**
@@ -373,6 +403,23 @@ function registerCronRecoveryHook(api: OpenClawPluginApi): void {
     }
 
     logger.log(`${logTag} ═══════════════════════════════════════════`);
+  });
+}
+
+// ── Cron lifecycle: cron_changed hook ──────────────────────────────────────
+
+/**
+ * Register the cron_changed hook.
+ *
+ * openclaw 的 gateway 在 cron 任务生命周期变化（added/updated/removed/
+ * started/finished）时发射该钩子。这里只保留任务变更云端同步；执行结果
+ * 打点由 registerCronRunLogHook（cron-YYYYMMDD.log）承担，全量上下文
+ * dump 日志已移除（过于啰嗦，排查价值被精简打点覆盖）。
+ */
+function registerCronChangedHook(api: OpenClawPluginApi): void {
+  api.on("cron_changed", async (event, _ctx) => {
+    // 任务变更同步到云端（added/updated/removed/finished；内部全 try/catch）
+    await syncScheduledTaskOnCronChanged(event);
   });
 }
 
@@ -582,7 +629,11 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       registerCLIHook(api);
       // Cron recovery hook: prunes stale cron-push-map and pushData on gateway startup
       registerCronRecoveryHook(api);
-      // Skills diagnostic hook: log skill usage (detected via SKILL.md reads)
+      // Cron lifecycle hook: sync scheduled-task changes to cloud on cron_changed
+      registerCronChangedHook(api);
+      // Cron run log hook: write one line per finished cron run to /tmp/openclaw/cron-*.log
+      registerCronRunLogHook(api);
+      // Skills usage logging hook: device tool mapping + exec/bash skill path detection
       registerSkillsDiagnosticHook(api);
     }
   },
