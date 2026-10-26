@@ -3,7 +3,6 @@ import type { ClawdbotConfig, RuntimeEnv, ReplyPayload } from "openclaw/plugin-s
 import { resolveRuntimeConversationBindingRoute } from "openclaw/plugin-sdk/conversation-runtime";
 import { updateSessionStoreEntry, updateSessionStore, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import {
-  callGatewayTool,
   resolveActiveEmbeddedRunSessionId,
   abortAgentHarnessRun,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -21,6 +20,7 @@ import { runWithSessionContext } from "../tools/session-manager.js";
 import { configManager } from "../utils/config-manager.js";
 import { addPushId } from "../utils/pushid-manager.js";
 import { getPushDataById } from "../utils/pushdata-manager.js";
+import { getOrCreateSessionId, rotateSessionId } from "../utils/session-id-registry.js";
 import { selfEvolutionManager } from "../utils/self-evolution-manager.js";
 import { saveRuntimeInfo } from "../utils/runtime-manager.js";
 import { toolCallNudgeManager } from "../utils/tool-call-nudge-manager.js";
@@ -256,16 +256,27 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
     const config = resolveXYConfig(cfg);
     cacheXYConfig(config);
 
+    // ✅ Resolve effective sessionId (xy_channel owned, persistent)
+    // 主对话 A2A sessionId 固定（如 "00000000"），靠换 sessionId 或 sessions.reset
+    // 都无法真正清空上下文（reset 只重置元数据/打边界，且 harness 清理易被上下文
+    // 压缩模型故障连累）。这里维护一个持久化的 effective sessionId（前端 id +
+    // 随机后缀），配合 dmScope="per-peer" 让 openclaw 按 effective id 分隔会话；
+    // clearContext 时只需轮换它即为全新上下文，绕开 reset、不受压缩影响。
+    const effectiveSessionId =
+      (await getOrCreateSessionId(parsed.sessionId)) ?? parsed.sessionId;
+
     // ✅ Resolve agent route (following feishu pattern)
     // accountId is "default" for XY (single account mode)
-    // Use sessionId as peer.id to ensure all messages in the same session share context
+    // Use effectiveSessionId as peer.id so different effective ids become
+    // different openclaw sessions (per-peer), enabling clean context isolation.
     let route = core.channel.routing.resolveAgentRoute({
       cfg,
       channel: "xiaoyi-channel",
       accountId,  // "default"
+      dmScope: "per-peer" as const,
       peer: {
         kind: "direct" as const,
-        id: parsed.sessionId,  // ✅ Use sessionId to share context within the same conversation session
+        id: effectiveSessionId,
       },
     });
 
@@ -289,7 +300,7 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
       route,
       channel: "xiaoyi-channel",
       accountId,
-      conversationId: parsed.sessionId,
+      conversationId: effectiveSessionId,
     });
     route = runtimeRoute.route;
     if (runtimeRoute.bindingRecord) {
@@ -329,9 +340,9 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
             if (!store[route.sessionKey]) {
               store[route.sessionKey] = {
                 // sessionId must pass validateSessionId regex /^[a-z0-9][a-z0-9._-]{0,127}$/i
-                // route.sessionKey like "agent:main:direct:xxx" contains colons which are invalid.
-                // Use parsed.sessionId (raw UUID from A2A) which is always safe.
-                sessionId: parsed.sessionId,
+                // route.sessionKey contains colons which are invalid.
+                // effectiveSessionId (frontend id + random suffix) is always safe.
+                sessionId: effectiveSessionId,
                 updatedAt: Date.now(),
                 providerOverride: "xiaoyiprovider",
                 modelOverride: modelName,
@@ -688,14 +699,19 @@ export async function handleXYMessage(params: HandleXYMessageParams): Promise<vo
 }
 
 /**
- * 固定会话（pinnedSessionIds，如 "00000000"）的 clearContext 隔离实现。
+ * 主对话 clearContext 的上下文隔离实现。
  *
- * 通过 gateway RPC `sessions.reset` 在同一 sessionKey 下轮换 openclaw 内层
- * sessionId：归档旧 transcript、abort 在途 run、停 subagent、清 bootstrap
- * 缓存，下一条消息即进入全新上下文。sessionKey 与 A2A sessionId 均不变，
- * 因此 sessionKey 反解、bindSessionKey、ACP binding 等映射全部不受影响。
+ * 背景：pinnedSessionIds（默认 "00000000"）的 A2A sessionId 永不变化，靠客户端
+ * 换 sessionId 无法天然隔离。而 gateway `sessions.reset` 只重置会话元数据、打 reset
+ * 边界，并不真正清空模型读到的上下文，且其前置 harness 清理易被上下文压缩模型
+ * 超时/报错连累而失败。
  *
- * reset 失败只记日志不抛出（clearContext 响应已先行发出，不能让客户端挂起）；
+ * 方案：轮换 xy_channel 自维护的 effective sessionId（持久化映射，见
+ * session-id-registry.ts）。配合 dmScope="per-peer"，openclaw 把不同 effective id
+ * 当作不同会话 → 下一条消息即进入全新上下文，彻底绕开 sessions.reset、不受压缩
+ * 模型故障影响。A2A 层 sessionId（前端 id）不变，前端协议/回执不受影响。
+ *
+ * rotate 失败只记日志不抛出（clearContext 响应已先行发出，不能让客户端挂起）；
  * finally 中清理 channel 侧以 A2A sessionId 为 key 的内存态，避免残留导致
  * 下一条消息被 hasActiveTask 误判为 steer、或被残留 wait state 抑制 cleanup。
  */
@@ -705,29 +721,16 @@ async function resetPinnedOpenclawSession(params: {
   accountId: string;
   sessionId: string;
 }): Promise<void> {
-  const { cfg, core, accountId, sessionId } = params;
+  const { sessionId } = params;
   const log = logger.withContext(sessionId, "");
   try {
-    // 用与正常消息相同的路由推导拿到 sessionKey（agent:main:direct:<sessionId>）
-    const route = core.channel.routing.resolveAgentRoute({
-      cfg,
-      channel: "xiaoyi-channel",
-      accountId,
-      peer: {
-        kind: "direct" as const,
-        id: sessionId,
-      },
-    });
-    log.log(`[CLEAR_CONTEXT] Resetting pinned session via gateway RPC, sessionKey=${route.sessionKey}`);
-    // 在途 run 的 abort+等待可能长达 ~15s（openclaw 内部超时），RPC 超时给足余量
-    await callGatewayTool(
-      "sessions.reset",
-      { timeoutMs: 25_000 },
-      { key: route.sessionKey, reason: "new" },
+    const rotated = await rotateSessionId(sessionId);
+    log.log(
+      `[CLEAR_CONTEXT] Rotated effective sessionId (context cleared): ` +
+        `frontend=${sessionId}, effective=${rotated ?? "<null>"}`,
     );
-    log.log(`[CLEAR_CONTEXT] sessions.reset succeeded, sessionKey=${route.sessionKey}`);
   } catch (err) {
-    log.error(`[CLEAR_CONTEXT] sessions.reset failed (context may not be isolated):`, err);
+    log.error(`[CLEAR_CONTEXT] Failed to rotate effective sessionId:`, err);
   } finally {
     try {
       const currentTaskId = getCurrentTaskId(sessionId);
