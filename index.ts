@@ -8,6 +8,7 @@ import registerSentinelHook from "./src/cspl/sentinel_hook.js";
 import registerSkillScopeHook from "./plugin-scope/skill_scope_hook.js";
 import { setXYRuntime } from "./src/runtime.js";
 import { markCronToolCall, clearCronToolCall, getCurrentSessionContext, setCronToolRunInfo, clearCronToolRunInfo, isCronActive } from "./src/tools/session-manager.js";
+import { parseCronJobIdFromSessionKey, registerCronToolGuard } from "./src/tools/cron-tool-guard.js";
 import { configManager } from "./src/utils/config-manager.js";
 import { setJobPushId } from "./src/utils/cron-push-map.js";
 import { getAllPushIds } from "./src/utils/pushid-manager.js";
@@ -101,15 +102,6 @@ function registerSkillsDiagnosticHook(api: OpenClawPluginApi) {
       }
     }
   });
-}
-/**
- * 从 openclaw sessionKey 解析 cron jobId。
- * 格式形如 `agent:<agentId>:cron:<jobId>:run:<startedAtTs>`（隔离 run 为
- * `cron:<jobId>`），jobId 位于 "cron:" 之后到下一个冒号/空白之前。
- */
-function parseCronJobIdFromSessionKey(sessionKey: string): string | undefined {
-  const match = sessionKey.match(/cron:([^:\s]+)/);
-  return match ? match[1] : undefined;
 }
 
 /**
@@ -624,6 +616,8 @@ const plugin: OpenClawPluginDefinition = definePluginEntry({
       // Skill scope hook: before_install 云端安全扫描（skill/plugin 安装前预检，
       // 扫描 REJECT 阻断；扫描异常 skill 放行、plugin 阻断；内核侧对 hook 异常 fail-closed）
       registerSkillScopeHook(api);
+      // Cron tool guard: rejects unsupported tools before they can produce side effects
+      registerCronToolGuard(api);
       // Cron detection hook: marks toolCallIds from cron sessions
       registerCronDetectionHook(api);
       // CLI exec hook: intercepts built-in exec for HarmonyOS CLI skill tools
