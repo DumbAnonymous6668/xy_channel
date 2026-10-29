@@ -87,5 +87,21 @@ describe("isRetryableProviderError", () => {
       // stable provider-side rejection.
       expect(isRetryableProviderError("{}")).toBe(false);
     });
+
+    it("does not retry HTTP-error `fetch failed` with a status code (404/5xx)", () => {
+      // A `(404)`/`(5xx)` status proves a real provider response (endpoint /
+      // upstream error), not a transient transport cut — retrying won't help.
+      // Aligned with openclaw's isWrappedFetchFailed.
+      expect(isRetryableProviderError("Web fetch failed (404): https://... - Not Found")).toBe(false);
+      expect(isRetryableProviderError("Web fetch failed (502): upstream connect error")).toBe(false);
+      expect(isRetryableProviderError("fetch (404)")).toBe(false);
+      expect(isRetryableProviderError("HTTP 404 Not Found: /v1/chat/completions")).toBe(false);
+    });
+
+    it("still retries a bare `fetch failed` with no status code (pure transport)", () => {
+      expect(isRetryableProviderError("fetch failed")).toBe(true);
+      expect(isRetryableProviderError("TypeError: fetch failed")).toBe(true);
+      expect(isRetryableProviderError("Request failed: fetch failed")).toBe(true);
+    });
   });
 });

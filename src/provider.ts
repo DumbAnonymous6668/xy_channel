@@ -75,7 +75,6 @@ const TRANSPORT_TERMINATION_RE =
 /** Short human-readable snippets that indicate a cut/timed-out transport stream. */
 const TRANSPORT_TERMINATION_SNIPPETS = [
   "socket hang up",
-  "fetch failed",
   "network is unreachable",
   "temporary failure in name resolution",
   "upstream connect error",
@@ -90,6 +89,18 @@ const TRANSPORT_TERMINATION_SNIPPETS = [
 ];
 
 /**
+ * True when the message is a wrapped undici `fetch failed` without an HTTP
+ * status code — a transient transport failure. Mirrors openclaw's
+ * retryable-network-errors: keep "...: fetch failed", but avoid broad matches
+ * like "Web fetch failed (404): ..." / "Web fetch failed (502): ..." which are
+ * real provider-side responses (Not Found / upstream) that retrying won't fix.
+ */
+function isWrappedFetchFailed(message: string): boolean {
+  if (message === "fetch failed") return true;
+  return /:\s*fetch failed$/.test(message);
+}
+
+/**
  * Check if an errorMessage indicates a retryable provider error by type.
  * Covers both the known transient server/rate-limit texts (from the upstream
  * LLM gateway) and undici/Node transport-termination errors (the stream was
@@ -102,9 +113,16 @@ export function isRetryableProviderError(message: string | undefined): boolean {
   if (lower.includes("the server had an error while processing your request")) return true;
   if (lower.includes("rate limit reached for requests")) return true;
   if (lower.includes("现在访问有点拥挤，稍等一下再试会更顺畅哦～")) return true;
+  // A `fetch failed (<status>)` proves a real provider response (endpoint /
+  // upstream error: 404 Not Found, 502, etc.), NOT a transient transport cut —
+  // exclude it BEFORE the transport snippets/snippets so e.g. neither
+  // "fetch failed (404)" nor combined texts like "Web fetch failed (502):
+  // upstream connect error" get retried. Mirrors openclaw's isWrappedFetchFailed.
+  if (/fetch failed\s*\(\s*\d{3}\s*\)/i.test(lower)) return false;
   // undici / Node transport termination — transient stream cut / timeout.
   if (TRANSPORT_TERMINATION_RE.test(lower)) return true;
   if (TRANSPORT_TERMINATION_SNIPPETS.some(snippet => lower.includes(snippet))) return true;
+  if (isWrappedFetchFailed(lower)) return true;
   return false;
 }
 
