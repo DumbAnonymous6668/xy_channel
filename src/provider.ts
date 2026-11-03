@@ -20,6 +20,33 @@ import { sendStatusUpdate } from "./formatter.js";
 const RETRY_DELAYS_MS = [10_000, 20_000, 40_000, 60_000, 60_000];
 const MAX_RETRY_ATTEMPTS = 5;
 
+const MAX_TOKENS_PAYLOAD_FIELDS = ["max_tokens", "max_completion_tokens", "maxOutputTokens"] as const;
+
+function formatMaxTokensFields(source: unknown, fields: readonly string[], prefix: string): string {
+  const record = source && typeof source === "object"
+    ? source as Record<string, unknown>
+    : undefined;
+  return fields.map((field) => {
+    const present = record !== undefined && Object.prototype.hasOwnProperty.call(record, field);
+    return `${prefix}.${field}.present=${present} ${prefix}.${field}.value=${present ? String(record[field]) : "undefined"}`;
+  }).join(" ");
+}
+
+function logMaxTokensState(stage: string, model: any, options: unknown): void {
+  logger.log(
+    `[maxTokens] stage=${stage} model=${model?.id ?? "unknown"} ` +
+    `${formatMaxTokensFields(model, ["maxTokens"], "model")} ` +
+    `${formatMaxTokensFields(options, ["maxTokens"], "options")}`,
+  );
+}
+
+function logMaxTokensPayload(stage: string, payload: unknown, model: any): void {
+  logger.log(
+    `[maxTokens] stage=${stage} model=${model?.id ?? "unknown"} ` +
+    formatMaxTokensFields(payload, MAX_TOKENS_PAYLOAD_FIELDS, "payload"),
+  );
+}
+
 // ── Kimi_K3 fallback config ───────────────────────────────────
 // Kimi_K3 gets broader error handling: ANY model error — including
 // content_filter rejections like {"error":{"type":"content_filter",...}} —
@@ -750,14 +777,14 @@ export const xiaoyiProvider: ProviderPlugin = {
       baseUrl = (ctx.config as any)?.models?.providers?.zai?.baseUrl;
     }
     if (!baseUrl || typeof baseUrl !== "string") return null;
-    return {
+    const resolvedModel = {
       id: ctx.modelId,
       name: ctx.modelId,
       api: ctx.providerConfig?.api ?? "openai-completions",
       provider: "xiaoyiprovider",
       baseUrl,
       reasoning: true,
-      input: ["text"],
+      input: ["text"] as ("text" | "image")[],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 256_000,
       maxTokens: 64_000,
@@ -776,6 +803,8 @@ export const xiaoyiProvider: ProviderPlugin = {
             [HEADER_INTERACTION_ID]: globalTraceContext.interactionId,
           } } : {})),
     };
+    logMaxTokensState("resolveDynamicModel", resolvedModel, undefined);
+    return resolvedModel;
   },
 
   /**
@@ -785,6 +814,7 @@ export const xiaoyiProvider: ProviderPlugin = {
    * or uid fallback.
    */
   prepareExtraParams: (ctx) => {
+    logMaxTokensState("prepareExtraParams", undefined, ctx.extraParams);
     const uid = getUidFromConfig(ctx.config);
     if (!uid) return undefined;
 
@@ -842,6 +872,7 @@ export const xiaoyiProvider: ProviderPlugin = {
     if (!underlying) return underlying;
 
     return async (model, context, options) => {
+      logMaxTokensState("wrapStreamFn.input", model, options);
       const dynamicHeaders: Record<string, string> = {};
 
       // ── Extract A2A taskId/deviceType from Conversation info ──
@@ -1122,14 +1153,29 @@ export const xiaoyiProvider: ProviderPlugin = {
       const cronJob = isCronTriggered(context.messages);
       if (cronJob) logger.log("[xiaoyiprovider] detected cron-triggered request, using extended retry delays");
 
-      const streamCallOptions = {
+      const createStreamCallOptions = (callType: string, callSeq: number) => ({
         ...options,
         headers: {
           ...options?.headers,
           ...dynamicHeaders,
         },
+        onPayload: async (payload, payloadModel) => {
+          const nextPayload = await options?.onPayload?.(payload, payloadModel);
+          logMaxTokensPayload(
+            `payload.${callType}.call=${callSeq}`,
+            nextPayload === undefined ? payload : nextPayload,
+            payloadModel ?? model,
+          );
+          return nextPayload;
+        },
+      });
+      let primaryStreamCallCount = 0;
+      const makeStream = () => {
+        const callSeq = ++primaryStreamCallCount;
+        const streamCallOptions = createStreamCallOptions("primary", callSeq);
+        logMaxTokensState(`stream-options.primary.call=${callSeq}`, model, streamCallOptions);
+        return underlying(model, context, streamCallOptions);
       };
-      const makeStream = () => underlying(model, context, streamCallOptions);
 
       // ── Kimi_K3: retry any error, then fall back to MiniMax-M3 once ──
       // Scoped to this request only: `model` is a per-call local and the
@@ -1159,7 +1205,12 @@ export const xiaoyiProvider: ProviderPlugin = {
         cronJob,
         retryOnAnyError: isKimiK3,
         fallbackCreateStream: isKimiK3
-          ? () => underlying({ ...model, id: KIMI_K3_FALLBACK_MODEL_ID, name: KIMI_K3_FALLBACK_MODEL_ID }, context, streamCallOptions)
+          ? () => {
+              const fallbackModel = { ...model, id: KIMI_K3_FALLBACK_MODEL_ID, name: KIMI_K3_FALLBACK_MODEL_ID };
+              const streamCallOptions = createStreamCallOptions("fallback", 1);
+              logMaxTokensState("stream-options.fallback.call=1", fallbackModel, streamCallOptions);
+              return underlying(fallbackModel, context, streamCallOptions);
+            }
           : undefined,
         onFallback: isKimiK3 ? notifyKimiK3Fallback : undefined,
         onFallbackDone: isKimiK3

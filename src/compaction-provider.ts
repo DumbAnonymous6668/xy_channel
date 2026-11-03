@@ -244,6 +244,12 @@ export const xiaoyiCompactionProvider = {
       temperature: 0.3,
     };
 
+    logger.log(
+      `[maxTokens] stage=compaction.payload model=${cfg.modelName} ` +
+      `payload.max_tokens.present=${Object.prototype.hasOwnProperty.call(body, "max_tokens")} ` +
+      `payload.max_tokens.value=${String(body.max_tokens)}`,
+    );
+
     const url = `${cfg.baseUrl.replace(/\/+$/, "")}/chat/completions`;
     // Log headers for diagnostics (redact sensitive values)
     const safeHeaders: Record<string, string> = {};
